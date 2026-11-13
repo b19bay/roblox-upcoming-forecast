@@ -1,54 +1,12 @@
-// Roblox Up-and-Coming top-10 forecaster, written for make.fun's
-// roblox-up-and-coming-forecast-01 (Node 22, standard library only).
-//
-// Idea: forecast the chart by simulating it. Every game gets a latent score
-// s = -(rank)^alpha, so the chart is the games ordered by score, best first.
-// Each simulated hour a game's score moves by a predictable drift plus
-// unpredictable noise; the forecast is the time-average over 5,000 seeded
-// simulations of the 72-hour window: for each place, the fraction of
-// (simulation, hour) pairs each game held it. That is an honest probability
-// under the model, which is what a log score rewards.
-//
-// What the history (34 archive reads, 2026-10-30..2026-11-07) actually shows:
-//  - Rank mobility grows with rank: mean |24h move| is 4.8 ranks at the top
-//    (1-10), 10.5 at 11-30, 13.0 at 31-60, 15.4 at 61-100. A fixed score noise
-//    under s = -rank^(1/3) produces mobility growing as r^(2/3), which is the
-//    shape seen, so alpha = 1/3 is the default (the exponent is a parameter,
-//    and the code recomputes every score-space quantity from it).
-//  - Young games climb hard: mid-history debutants move -0.62 ranks/hour in
-//    their first 48 hours; the mean velocity then flattens and turns to a
-//    slow fall (+0.06 to +0.07 ranks/hour past day 5). That life-cycle curve
-//    is the age drift. The old-age end is deliberately flatter than the raw
-//    measurement (+0.20 at 6-10d): the raw level includes the common downward
-//    drift the simulation already produces through entrants, and the 72h
-//    backtests confirm the flatter curve scores better.
-//  - A joint least-squares fit of next-24h rank velocity on the life-cycle
-//    expectation, the idiosyncratic part of recent velocity, and 24h log
-//    playing growth gives (R^2 0.17): age weight 0.73, momentum slope 0.11,
-//    playing-growth slope -0.34 on the practice window and -0.42 on a second
-//    backtest window; the adopted -0.40 sits between the two fits and scores
-//    best on both windows. The playing surge leads the rank climb by about a
-//    day: the chart is computed on a delay, not live. There is also a common
-//    +0.22 ranks/hour downward drift, which the simulation produces on its
-//    own through entrants and climbers, so it is not added explicitly.
-//  - The unpredictable part: sigma ~0.09 score units per sqrt-hour, estimated
-//    from the drift model's own residuals on 24h prediction triples (MAD).
-//  - New games arrive at 0.56/hour (13.4/day), debuting near the bottom
-//    (median rank 87). 16% of them are breakouts that reach the top 10
-//    (median 45 hours); their climbs are stored as (debut rank, hours to the
-//    top 10, peak rank) and turned into a score drift at run time.
-//  - Games leave the chart: measured disappearance hazards per hour are 0.001
-//    in the top 10, 0.002 at 11-60, 0.018 below 60. Games with a known
-//    publication date leave at 28 days instead.
-//  - 23% of top-10 slots 72 hours out are games that were not on the chart at
-//    all, so each place keeps at least a 15% unnamed share.
-//
-// Deterministic: a seeded PRNG (mulberry32 + Box-Muller), fixed iteration
-// orders, ties broken by universe id. Two runs on the same input produce the
-// same forecast.json byte for byte.
-//
-// Usage (outside the grader): MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out
-//   node main.ts
+// Roblox Up-and-Coming top-10 forecaster, v3 (make.fun
+// roblox-up-and-coming-forecast-01; Node 22, standard library only).
+// Monte Carlo in latent-score space: s = -(rank)^(1/3), 5,000 seeded
+// simulations, time-averaged over the 72-hour window. v3 changes:
+// momentum slope 0.05 (raw velocity is mostly noise), a 5% persistence
+// blend of each place's distribution toward the game holding that place
+// in the last snapshot, and top-10 ordering by median place. Local
+// scores: practice -32.116, backtest2 -32.775, held-out -31.151.
+// Usage: MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out node main.ts
 
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -69,6 +27,9 @@ export interface Params {
   ageWeight: number;
   /** Momentum persistence slope (next velocity per unit past velocity). */
   momentumSlope: number;
+  /** Persistence blend: weight on the game holding each place in the last
+      snapshot, mixed into that place's Monte Carlo distribution. */
+  lastSnapBlend: number;
   /** Momentum half-life, hours. */
   momentumHalflifeH: number;
   /** Playing-growth slope: ranks/hour per unit 24h log playing growth. */
@@ -130,7 +91,8 @@ export const DEFAULT_PARAMS: Params = {
   sigma: 0, // estimate from history
   exponent: 1 / 3,
   ageWeight: 0.73,
-  momentumSlope: 0.11,
+  momentumSlope: 0.05,
+  lastSnapBlend: 0.05,
   momentumHalflifeH: 36,
   playingGrowthSlope: -0.4,
   playingGrowthFullH: 24,
@@ -574,6 +536,8 @@ export interface SimResult {
   expectedRank: Map<number, number>;
   /** game id -> total top-10 probability mass over all places. */
   top10Mass: Map<number, number>;
+  /** place -> game id holding it in the last snapshot (persistence blend). */
+  lastSnap: Map<number, number>;
 }
 
 export function simulate(hist: ParsedHistory, params: Params): SimResult {
@@ -727,7 +691,15 @@ export function simulate(hist: ParsedHistory, params: Params): SimResult {
   for (const [id, s] of rankSum) {
     expectedRank.set(id, s / (rankCount.get(id) ?? 1));
   }
-  return { prob, unnamed, expectedRank, top10Mass };
+  // Last snapshot's top 10, for the persistence blend in assemble().
+  const lastSnap = new Map<number, number>();
+  const lastSnapshot = hist.snapshots[hist.snapshots.length - 1];
+  if (lastSnapshot) {
+    for (const g of lastSnapshot.up_and_coming) {
+      if (g.rank >= 1 && g.rank <= places) lastSnap.set(g.rank, g.universe_id);
+    }
+  }
+  return { prob, unnamed, expectedRank, top10Mass, lastSnap };
 }
 
 // ---- Forecast assembly ----
@@ -736,10 +708,34 @@ export interface Forecast {
   top10: number[];
 }
 
+// Persistence blend: mix a small weight of the game holding a place in the
+// last snapshot into that place's Monte Carlo distribution. The blend
+// preserves the place's total named mass: the last-snapshot game gets
+// weight * rawSum on top of its (1 - weight)-scaled Monte Carlo mass, and
+// every other game keeps its (1 - weight)-scaled mass. A no-op when the
+// weight is 0 or the place has no last-snapshot game.
+function blendWithLastSnap(
+  m: Map<number, number>,
+  lastSnapId: number | undefined,
+  weight: number,
+): Map<number, number> {
+  if (weight <= 0 || lastSnapId === undefined) return m;
+  let rawSum = 0;
+  for (const p of m.values()) rawSum += p;
+  const out = new Map<number, number>();
+  for (const [id, p] of m) out.set(id, (1 - weight) * p);
+  out.set(lastSnapId, (out.get(lastSnapId) ?? 0) + weight * rawSum);
+  return out;
+}
+
 export function assemble(sim: SimResult, places: number, params: Params): Forecast {
   const probabilities: Forecast['probabilities'] = [];
   for (let k = 1; k <= places; k++) {
-    const m = sim.prob.get(k) ?? new Map<number, number>();
+    const m = blendWithLastSnap(
+      sim.prob.get(k) ?? new Map<number, number>(),
+      sim.lastSnap.get(k),
+      params.lastSnapBlend,
+    );
     const rows = [...m.entries()]
       .filter(([, p]) => p >= params.minNamedP)
       .sort((a, b) => b[1] - a[1] || a[0] - b[0])
@@ -756,24 +752,30 @@ export function assemble(sim: SimResult, places: number, params: Params): Foreca
     }
   }
 
-  // top10: the ten games with the most top-10 mass, ordered by expected place.
-  const expectedPlace = new Map<number, number>();
+  // top10: the ten games with the most top-10 mass, ordered by median place.
+  // The median (not the mean) is the order statistic the agreement tie-break
+  // rewards: it minimises expected absolute deviation from the actual place.
+  const medianPlace = new Map<number, number>();
   for (const [id] of sim.top10Mass) {
-    let num = 0;
     let den = 0;
+    for (let k = 1; k <= places; k++) den += sim.prob.get(k)?.get(id) ?? 0;
+    let cum = 0;
+    let med = 99;
     for (let k = 1; k <= places; k++) {
-      const p = sim.prob.get(k)?.get(id) ?? 0;
-      num += k * p;
-      den += p;
+      cum += sim.prob.get(k)?.get(id) ?? 0;
+      if (den > 0 && cum >= den / 2) {
+        med = k;
+        break;
+      }
     }
-    expectedPlace.set(id, den > 0 ? num / den : 99);
+    medianPlace.set(id, med);
   }
   const top10 = [...sim.top10Mass.entries()]
     .sort((a, b) => b[1] - a[1] || a[0] - b[0])
     .slice(0, places)
     .sort(
       (a, b) =>
-        (expectedPlace.get(a[0]) ?? 99) - (expectedPlace.get(b[0]) ?? 99) ||
+        (medianPlace.get(a[0]) ?? 99) - (medianPlace.get(b[0]) ?? 99) ||
         a[0] - b[0],
     )
     .map(([id]) => id);
