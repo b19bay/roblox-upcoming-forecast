@@ -1,11 +1,14 @@
-// Roblox Up-and-Coming top-10 forecaster, v3 (make.fun
+// Roblox Up-and-Coming top-10 forecaster, v4 (make.fun
 // roblox-up-and-coming-forecast-01; Node 22, standard library only).
 // Monte Carlo in latent-score space: s = -(rank)^(1/3), 5,000 seeded
-// simulations, time-averaged over the 72-hour window. v3 changes:
-// momentum slope 0.05 (raw velocity is mostly noise), a 5% persistence
-// blend of each place's distribution toward the game holding that place
-// in the last snapshot, and top-10 ordering by median place. Local
-// scores: practice -32.116, backtest2 -32.775, held-out -31.151.
+// simulations, time-averaged over the 72-hour window. v4 changes:
+// the entrant rate is multiplied by 3 (the observed debut rate
+// undercounts the effective competition for top-10 slots, and extra
+// entrants flatten an overconfident distribution), and the persistence
+// blend now decays linearly by place, 0.08 at place 1 down to 0.02 at
+// the last place (top places are stickier than lower ones). Local
+// scores: practice -31.978, backtest2 -32.688, held-out backtest3
+// -31.106, held-out backtest4 -34.729; 3-window mean -31.924 (v3 -32.014).
 // Usage: MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out node main.ts
 
 import { readFileSync, writeFileSync } from 'node:fs';
@@ -27,9 +30,13 @@ export interface Params {
   ageWeight: number;
   /** Momentum persistence slope (next velocity per unit past velocity). */
   momentumSlope: number;
-  /** Persistence blend: weight on the game holding each place in the last
-      snapshot, mixed into that place's Monte Carlo distribution. */
-  lastSnapBlend: number;
+  /** Persistence blend weight at place 1: weight on the game holding the
+      place in the last snapshot, mixed into that place's Monte Carlo
+      distribution. Top places are stickier than lower ones. */
+  blendTop: number;
+  /** Persistence blend weight at the last place (see blendTop); the weight
+      decays linearly between the two across places. */
+  blendBottom: number;
   /** Momentum half-life, hours. */
   momentumHalflifeH: number;
   /** Playing-growth slope: ranks/hour per unit 24h log playing growth. */
@@ -42,6 +49,10 @@ export interface Params {
   /** New games entering the chart per hour (fallback; estimated when the
       history has enough debuts). */
   entrantsPerHour: number;
+  /** Multiplier on the entrant rate: the observed debut rate undercounts
+      the effective competition for top-10 slots, and extra entrants
+      flatten an overconfident distribution. */
+  entrantRateMult: number;
   /** Fraction of entrants that are viral breakouts. */
   breakoutShare: number;
   /** Minimum unnamed share left at each place. */
@@ -92,12 +103,14 @@ export const DEFAULT_PARAMS: Params = {
   exponent: 1 / 3,
   ageWeight: 0.73,
   momentumSlope: 0.05,
-  lastSnapBlend: 0.05,
+  blendTop: 0.08,
+  blendBottom: 0.02,
   momentumHalflifeH: 36,
   playingGrowthSlope: -0.4,
   playingGrowthFullH: 24,
   playingGrowthDecayH: 24,
   entrantsPerHour: 0.56,
+  entrantRateMult: 3,
   breakoutShare: 0.16,
   minUnnamed: 0.15,
   minNamedP: 0.003,
@@ -440,7 +453,8 @@ export function parseHistory(inputDir: string, params: Params): ParsedHistory {
   // Entrant rate per hour (new games per hour over the history).
   const spanH = Math.max(1, (lastMs - firstMs) / HOUR_MS);
   const entrantsPerHour =
-    debutRanks.length > 5 ? debutRanks.length / spanH : params.entrantsPerHour;
+    (debutRanks.length > 5 ? debutRanks.length / spanH : params.entrantsPerHour) *
+    params.entrantRateMult;
 
   // Sigma: robust scale of the drift model's own residuals. For each 24h
   // prediction triple (i, j, k) and each top-40 game at j, compare the actual
@@ -731,10 +745,15 @@ function blendWithLastSnap(
 export function assemble(sim: SimResult, places: number, params: Params): Forecast {
   const probabilities: Forecast['probabilities'] = [];
   for (let k = 1; k <= places; k++) {
+    // Persistence is strongest at the top: the blend weight decays linearly
+    // from blendTop at place 1 to blendBottom at the last place.
+    const w =
+      params.blendTop +
+      ((params.blendBottom - params.blendTop) * (k - 1)) / Math.max(1, places - 1);
     const m = blendWithLastSnap(
       sim.prob.get(k) ?? new Map<number, number>(),
       sim.lastSnap.get(k),
-      params.lastSnapBlend,
+      w,
     );
     const rows = [...m.entries()]
       .filter(([, p]) => p >= params.minNamedP)

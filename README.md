@@ -49,10 +49,13 @@ noise:
 - **Diffusion**: hourly Gaussian noise with σ estimated from the history
   as the robust spread of the drift model's own residuals on 24-hour
   prediction triples (σ ≈ 0.09 on the practice history).
-- **New entrants** arrive at the measured rate (~13/day), debuting near
-  the bottom (median rank 87); ~16% are breakouts that climb to the top 10
-  with a drift and peak rank sampled from the 17 measured debut-to-top-10
-  climbs (median 45 hours to the top 10). Entrants are anonymous, so their
+- **New entrants** arrive at the measured rate (~13/day), multiplied by 3,
+  debuting near the bottom (median rank 87); ~16% are breakouts that climb
+  to the top 10 with a drift and peak rank sampled from the 17 measured
+  debut-to-top-10 climbs (median 45 hours to the top 10). The multiplier
+  is there because the observed debut rate undercounts the effective
+  competition for top-10 slots, and the extra entrants flatten an
+  overconfident distribution. Entrants are anonymous, so their
   mass flows into each place's unnamed share — as it should, since 23% of
   top-10 slots 72 hours out are games that were not on the chart at all.
 - **Age-out**: games leave the chart 28 days after publication. Games
@@ -64,9 +67,10 @@ The forecast is the honest time-average over the window: the fraction of
 at least a 15% unnamed share (the measured time-averaged share of top-10
 slots held by games not on the chart was 8% in the practice window and 16%
 in a second backtest window). Before output, each place's distribution is
-blended with a small persistence weight (5%) on the game holding that
-place in the last snapshot — the current chart is stickier than the
-simulation alone predicts. The top 10 list is ordered by each game's
+blended with a persistence weight on the game holding that place in the
+last snapshot — the current chart is stickier than the simulation alone
+predicts. The weight decays linearly by place, 0.08 at place 1 down to
+0.02 at place 10, because top places are stickier than lower ones. The top 10 list is ordered by each game's
 median simulated place (the median minimises expected absolute deviation,
 which is what the agreement tie-break measures). 5,000 simulations, seeded
 PRNG — two runs on the same input produce the same `forecast.json` byte
@@ -76,16 +80,17 @@ for byte.
 
 | Window | House baseline (persistence) | This entry |
 | --- | --- | --- |
-| Practice, 10 reads 8–10 Nov 2026 | −43.512 | **−32.116** |
-| Second backtest, 8 reads 6–7 Nov 2026 | −52.125 | **−32.775** |
-| Held-out, 7 reads 4–5 Nov 2026 | — | **−31.151** |
+| Practice, 10 reads 8–10 Nov 2026 | −43.512 | **−31.978** |
+| Second backtest, 8 reads 6–7 Nov 2026 | −52.125 | **−32.688** |
+| Held-out, 7 reads 4–5 Nov 2026 | — | **−31.106** |
+| Held-out backtest4, 7 reads 1–3 Nov 2026 | — | **−34.729** |
 
 The scorer replica implements the kit's `RULES.txt` scoring exactly and was
 validated by reproducing the house baseline's published practice score
 (−43.512039) to the digit.
 
-Parameter choices were checked on three windows (practice, second
-backtest, and a held-out window built after tuning), and a tuning was
+Parameter choices were checked on four windows (practice, second
+backtest, and two held-out windows built after tuning), and a tuning was
 adopted only if it improved the three-window mean without costing more
 than 0.3 on any single window: the square-root latent transform, a
 steeper trending-gap age fit, and fixed σ values were all tested and
